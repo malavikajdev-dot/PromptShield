@@ -495,6 +495,13 @@ export async function enforceViaArmorIQ(
     }
     return { decision: 'ALLOW', reason: 'Allowed by ArmorIQ policy.' };
   } catch (err: any) {
-    return { decision: 'BLOCK', reason: err?.message || 'ArmorIQ denied or failed the call.' };
+     let detail = '';
+     try {
+       detail = JSON.stringify(err, Object.getOwnPropertyNames(err)).slice(0, 700);
+     } catch {
+       detail = String(err);
+     }
+     console.error('[ArmorIQ invoke ERROR]', proposal.tool_name, detail);
+     return { decision: 'BLOCK', reason: `ArmorIQ error: ${detail.slice(0, 300)}` };
+   }
   }
-}
