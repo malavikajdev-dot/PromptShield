@@ -31,7 +31,7 @@ import {
   analyzePromptWithGemini,
 } from './src/server/geminiService.ts';
 import { getArmorIQStatus } from './src/server/armoriq.ts';
-import { captureAndAttestArmorIQPlan } from './src/server/armoriqIntegration.ts';
+import { captureAndAttestArmorIQPlan, enforceViaArmorIQ } from './src/server/armoriqIntegration.ts';
 import { initializeMcpServer } from './src/server/mcpServer.ts';
 import {
   runAllAutomatedTests,
@@ -173,10 +173,23 @@ app.post('/api/test/analyze', async (req: Request, res: Response) => {
 
     // Step 3: Backend Authorization Gateway Evaluation
     // Operates independently of AI's internal reasoning!
-    const gatewayEvaluation = evaluateAuthorizationGateway(
-      aiResponse.proposed_action,
-      { role: 'tester', origin: 'attack_playground' }
-    );
+       const localEvaluation = evaluateAuthorizationGateway(
+     aiResponse.proposed_action,
+     { role: 'tester', origin: 'attack_playground' }
+   );
+   let gatewayEvaluation = localEvaluation;
+   if (armorIqAttestation.isConfigured) {
+     const verdict = armorIqAttestation.intentTokenRaw
+       ? await enforceViaArmorIQ(aiResponse.proposed_action, armorIqAttestation.intentTokenRaw)
+       : { decision: 'BLOCK' as const, reason: armorIqAttestation.error || 'No intent token issued.' };
+     gatewayEvaluation = {
+       ...localEvaluation,
+       decision: verdict.decision,
+       reason: `ArmorIQ ${verdict.decision}: ${verdict.reason}`,
+       policyId: 'armoriq:promptshield-zero-trust',
+       matchedRule: 'ARMORIQ_PLATFORM_POLICY',
+     };
+   }
 
     // Step 4: Real MCP Tool Execution (Tools will NOT run if Gateway blocked)
     const toolExecution = await executeSandboxedTool(

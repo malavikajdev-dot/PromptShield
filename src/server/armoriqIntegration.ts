@@ -459,3 +459,42 @@ export async function invokeWithPolicy(
     result: mcpResponse.content,
   };
 }
+export interface ArmorIQVerdict {
+  decision: 'ALLOW' | 'BLOCK' | 'APPROVAL_REQUIRED';
+  reason: string;
+}
+
+export async function enforceViaArmorIQ(
+  proposal: ToolActionProposal,
+  intentToken: IntentToken
+): Promise<ArmorIQVerdict> {
+  const client = getArmorIQClient();
+  if (!client) return { decision: 'BLOCK', reason: 'ArmorIQ client not configured (fail closed).' };
+
+  try {
+    const raw: any = await client.invoke(
+      'promptshield-secure-mcp-server',
+      proposal.tool_name,
+      intentToken,
+      proposal.parameters || {}
+    );
+    console.log('[ArmorIQ invoke]', proposal.tool_name, JSON.stringify(raw)?.slice(0, 600));
+
+    const flag = String(raw?.decision ?? raw?.action ?? raw?.status ?? '').toLowerCase();
+    const reason = String(raw?.reason ?? raw?.error ?? raw?.message ?? '');
+
+    if (
+      raw?.allowed === false || raw?.blocked === true || raw?.isError === true ||
+      ['deny', 'denied', 'block', 'blocked'].includes(flag) ||
+      reason === 'no_matching_policy'
+    ) {
+      return { decision: 'BLOCK', reason: reason || 'Denied by ArmorIQ policy.' };
+    }
+    if (raw?.held === true || ['hold', 'held', 'pending', 'pending_approval', 'approval_required'].includes(flag)) {
+      return { decision: 'APPROVAL_REQUIRED', reason: reason || 'Held by ArmorIQ for human approval.' };
+    }
+    return { decision: 'ALLOW', reason: 'Allowed by ArmorIQ policy.' };
+  } catch (err: any) {
+    return { decision: 'BLOCK', reason: err?.message || 'ArmorIQ denied or failed the call.' };
+  }
+}
