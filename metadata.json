@@ -1,0 +1,6 @@
+{
+  "name": "PromptShield - AI Agent Security & Trust Platform",
+  "description": "Enterprise AI agent security testing platform featuring interactive prompt injection playgrounds, server-side authorization gateways, mock synthetic tools, verifiable cryptographic audit hash chains, and automated security test suites.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
