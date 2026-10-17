@@ -142,7 +142,26 @@ app.post('/api/policy/reset', (req: Request, res: Response) => {
   const policy = resetPolicyToDefault();
   res.json({ message: 'Security policy reset to factory zero-trust defaults.', policy });
 });
+async function evaluateGateway(
+  proposal: ToolActionProposal,
+  attestation: Awaited<ReturnType<typeof captureAndAttestArmorIQPlan>>,
+  origin: string
+) {
+  const local = evaluateAuthorizationGateway(proposal, { role: 'tester', origin });
+  if (!attestation.isConfigured) return local;
 
+  const verdict = attestation.intentTokenRaw
+    ? await enforceViaArmorIQ(proposal, attestation.intentTokenRaw)
+    : { decision: 'BLOCK' as const, reason: attestation.error || 'No intent token issued.' };
+
+  return {
+    ...local,
+    decision: verdict.decision,
+    reason: `ArmorIQ ${verdict.decision}: ${verdict.reason}`,
+    policyId: 'armoriq:promptshield-zero-trust',
+    matchedRule: 'ARMORIQ_PLATFORM_POLICY',
+  };
+}
 /**
  * POST /api/test/analyze
  * Main Attack Playground execution pipeline
@@ -270,9 +289,10 @@ app.post('/api/test/compare', async (req: Request, res: Response) => {
       protectedAi.proposed_action,
       protectedAi.model
     );
-    const gatewayEvaluation = evaluateAuthorizationGateway(
+        const gatewayEvaluation = await evaluateGateway(
       protectedAi.proposed_action,
-      { role: 'tester', origin: 'comparison_engine' }
+      armorIqAttestation,
+      'comparison_engine'
     );
     const protectedTool = await executeSandboxedTool(
       protectedAi.proposed_action,
