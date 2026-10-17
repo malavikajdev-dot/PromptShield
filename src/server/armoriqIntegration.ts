@@ -198,11 +198,14 @@ export async function captureAndAttestArmorIQPlan(
       goal: `Execution of ${proposal.tool_name} for user prompt`,
       steps: [
         {
+          
           step_id: 1,
           action: proposal.tool_name,
-          tool: proposal.tool_name,
+          tool: 'promptshield-secure-mcp-server',
           mcp: 'promptshield-secure-mcp-server',
+          inputs: proposal.parameters || {},
           params: proposal.parameters || {},
+
         },
       ],
     };
