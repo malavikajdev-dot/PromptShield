@@ -1,495 +1,114 @@
 /**
- * PromptShield Server-Side Entrypoint
- *
- * Runs Express backend APIs with Vite SPA middleware.
- * All Gemini AI calls, authorization gateway rules, audit logs, and mock tools
- * execute strictly within this server runtime.
+ * PromptShield standalone MCP server (stateless Streamable HTTP).
+ * Deploy as its own Render service, then register its public URL
+ * (https://<service>.onrender.com/mcp) under Inventory -> MCP Servers on ArmorIQ.
+ * All data is synthetic. Enforcement happens in ArmorIQ, not here.
  */
+import express, { Request, Response, NextFunction } from 'express';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { z } from 'zod';
+import { SYNTHETIC_CRM_RECORDS, SYNTHETIC_DOCUMENTS } from './syntheticData.ts';
 
-import 'dotenv/config';
-import express, { Request, Response } from 'express';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import {
-  evaluateAuthorizationGateway,
-  getActivePolicy,
-  resetPolicyToDefault,
-  updateSecurityPolicy,
-} from './src/server/policyEngine.ts';
-import { executeSandboxedTool } from './src/server/mockTools.ts';
-import {
-  appendAuditEvent,
-  approvePendingAuditEvent,
-  getAuditLogs,
-  initializeAuditStorage,
-  restoreChainIntegrity,
-  simulateTampering,
-  verifyAuditChainIntegrity,
-} from './src/server/auditChain.ts';
-import {
-  analyzePromptDeterministicFallback,
-  analyzePromptWithGemini,
-} from './src/server/geminiService.ts';
-import { getArmorIQStatus } from './src/server/armoriq.ts';
-import { captureAndAttestArmorIQPlan, enforceViaArmorIQ } from './src/server/armoriqIntegration.ts';
-import { initializeMcpServer } from './src/server/mcpServer.ts';
-import {
-  runAllAutomatedTests,
-  TEST_DEFINITIONS,
-} from './src/server/testRunner.ts';
-import {
-  ComparisonResult,
-  PlaygroundTestResult,
-  SystemHealthStatus,
-  ToolActionProposal,
-} from './src/types/security.ts';
+const PORT = Number(process.env.PORT || 8080);
+const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || '';
+const SERVER_NAME = 'promptshield-secure-mcp-server';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const text = (obj: unknown) => ({
+  content: [{ type: 'text' as const, text: JSON.stringify(obj) }],
+});
+
+function buildServer(): McpServer {
+  const server = new McpServer({ name: SERVER_NAME, version: '1.0.0' });
+
+  server.tool(
+    'read_public_document',
+    'Read a synthetic public demo document.',
+    { path: z.string().optional() },
+    async ({ path }) => {
+      const key = path || 'doc:public/demo.txt';
+      const doc = SYNTHETIC_DOCUMENTS[key];
+      if (!doc || doc.scope !== 'public') return text({ success: false, error: `No public document at ${key}` });
+      return text({ success: true, path: doc.path, title: doc.title, content: doc.content });
+    }
+  );
+
+  server.tool(
+    'summarize_customer_records',
+    'Aggregated synthetic customer statistics (no raw PII).',
+    { planFilter: z.string().optional() },
+    async ({ planFilter }) => {
+      let rows = SYNTHETIC_CRM_RECORDS;
+      if (planFilter && planFilter !== 'ALL') rows = rows.filter((r) => r.plan.toLowerCase() === planFilter.toLowerCase());
+      return text({
+        success: true,
+        totalCount: rows.length,
+        aggregatedSpendUsd: rows.reduce((a, r) => a + r.syntheticSpendUsd, 0),
+      });
+    }
+  );
+
+  server.tool('list_permitted_resources', 'List public synthetic resources.', {}, async () =>
+    text({
+      success: true,
+      publicResources: Object.values(SYNTHETIC_DOCUMENTS)
+        .filter((d) => d.scope === 'public')
+        .map((d) => ({ path: d.path, title: d.title })),
+    })
+  );
+
+  // Sensitive tools: registered so ArmorIQ policies can deny them. Synthetic data only.
+  server.tool(
+    'read_restricted_file',
+    'Read a restricted synthetic file (should be denied by policy).',
+    { path: z.string().optional() },
+    async ({ path }) => {
+      const doc = SYNTHETIC_DOCUMENTS[path || 'doc:restricted/financials_q3.csv'];
+      return text(doc ? { success: true, path: doc.path, content: doc.content } : { success: false, error: 'Not found' });
+    }
+  );
+
+  server.tool('export_crm_records', 'Export raw synthetic CRM records (should be denied by policy).', {}, async () =>
+    text({ success: true, records: SYNTHETIC_CRM_RECORDS })
+  );
+
+  server.tool(
+    'draft_email',
+    'Draft an email (never sent; sensitive egress).',
+    { to: z.string().optional(), subject: z.string().optional(), body: z.string().optional() },
+    async ({ to, subject, body }) => text({ success: true, status: 'DRAFT_ONLY_NOT_SENT', to, subject, body })
+  );
+
+  return server;
+}
 
 const app = express();
-const PORT = Number(process.env.PORT) || 3000;
-const serverStartTime = Date.now();
-
 app.use(express.json());
 
-// Initialize audit chain and storage on startup
-initializeAuditStorage();
-
-// Initialize real Model Context Protocol (MCP) Server on startup
-initializeMcpServer().catch((err) => {
-  console.error('[MCP Server] Initialization error:', err);
-});
-
-// -------------------------------------------------------------
-// API Endpoints
-// -------------------------------------------------------------
-
-/**
- * GET /api/health
- * Detailed real-time system health inspection
- */
-app.get('/api/health', (req: Request, res: Response) => {
-  const auditReport = verifyAuditChainIntegrity();
-  const policy = getActivePolicy();
-  const apiKey = process.env.GEMINI_API_KEY;
-  const hasGeminiKey = Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.trim() !== '');
-  const armorIqStatus = getArmorIQStatus();
-
-  const health: SystemHealthStatus = {
-    timestamp: new Date().toISOString(),
-    frontend: {
-      status: 'OPERATIONAL',
-      details: 'React 19 + TypeScript + Tailwind CSS UI responsive',
-    },
-    backendApi: {
-      status: 'OPERATIONAL',
-      uptimeSeconds: Math.floor((Date.now() - serverStartTime) / 1000),
-      details: 'Node.js Express authorization gateway & real MCP server active',
-    },
-    geminiApi: {
-      status: hasGeminiKey ? 'CONFIGURED' : 'FALLBACK_MODE',
-      model: hasGeminiKey ? 'gemini-3.8-flash' : 'deterministic-security-fallback-v1',
-      details: hasGeminiKey
-        ? 'Real Gemini 3.8 Flash model connected for threat analysis'
-        : 'Running deterministic AI security engine fallback (GEMINI_API_KEY unpopulated)',
-    },
-    securityPolicyEngine: {
-      status: 'OPERATIONAL',
-      activePolicyId: policy.id,
-      rulesEnforced:
-        policy.permittedTools.length +
-        policy.restrictedTools.length +
-        policy.restrictedResourceScopes.length +
-        policy.approvalRequiredOperations.length,
-      details: `Active policy ${policy.name} enforcing defaultDeny=${policy.defaultDeny}`,
-    },
-    auditStorage: {
-      status: 'OPERATIONAL',
-      storageType: 'DEVELOPMENT_LOCAL_PERSISTENT',
-      totalEvents: auditReport.totalRecords,
-      chainIntegrity: auditReport.isValid ? 'VALID' : 'TAMPER_DETECTED',
-    },
-    armorIq: {
-      status: armorIqStatus.isConfigured ? 'OPERATIONAL' : 'NOT_CONFIGURED',
-      details: armorIqStatus.statusText,
-      requirementsToEnable: armorIqStatus.missingEnvironmentVariables.map(
-        (v) => `Configure ${v} in server secrets`
-      ),
-    },
-  };
-
-  res.json(health);
-});
-
-/**
- * GET /api/policy & POST /api/policy & POST /api/policy/reset
- */
-app.get('/api/policy', (req: Request, res: Response) => {
-  res.json(getActivePolicy());
-});
-
-app.post('/api/policy', (req: Request, res: Response) => {
-  const result = updateSecurityPolicy(req.body);
-  if (!result.success) {
-    res.status(400).json({ error: result.error });
-    return;
-  }
-  res.json(result.policy);
-});
-
-app.post('/api/policy/reset', (req: Request, res: Response) => {
-  const policy = resetPolicyToDefault();
-  res.json({ message: 'Security policy reset to factory zero-trust defaults.', policy });
-});
-async function evaluateGateway(
-  proposal: ToolActionProposal,
-  attestation: Awaited<ReturnType<typeof captureAndAttestArmorIQPlan>>,
-  origin: string
-) {
-  const local = evaluateAuthorizationGateway(proposal, { role: 'tester', origin });
-  if (!attestation.isConfigured) return local;
-
-  const verdict = attestation.intentTokenRaw
-    ? await enforceViaArmorIQ(proposal, attestation.intentTokenRaw)
-    : { decision: 'BLOCK' as const, reason: attestation.error || 'No intent token issued.' };
-
-  return {
-    ...local,
-    decision: verdict.decision,
-    reason: `ArmorIQ ${verdict.decision}: ${verdict.reason}`,
-    policyId: 'armoriq:promptshield-zero-trust',
-    matchedRule: 'ARMORIQ_PLATFORM_POLICY',
-  };
-}
-/**
- * POST /api/test/analyze
- * Main Attack Playground execution pipeline
- */
-app.post('/api/test/analyze', async (req: Request, res: Response) => {
-  try {
-    const { prompt, scenarioTitle, scenarioKey, forceFallback } = req.body;
-
-    if (!prompt || typeof prompt !== 'string' || prompt.trim() === '') {
-      res.status(400).json({ error: 'Prompt is required.' });
-      return;
-    }
-
-    const testId = `test-${Date.now().toString(36)}-${Math.random().toString(36).substring(2, 6)}`;
-
-    // Step 1: AI Agent Analysis & Tool Action Proposal (Server-side Gemini or Fallback)
-    const aiResponse = forceFallback
-      ? analyzePromptDeterministicFallback(prompt, scenarioKey)
-      : await analyzePromptWithGemini(prompt, scenarioKey);
-
-    // Step 2: ArmorIQ Plan Capture & Cryptographic Intent Token Attestation
-    // Executes genuine ArmorIQ SDK client.capturePlan() and client.getIntentToken()
-    const armorIqAttestation = await captureAndAttestArmorIQPlan(
-      prompt,
-      aiResponse.proposed_action,
-      aiResponse.model
-    );
-
-    // Step 3: Backend Authorization Gateway Evaluation
-    // Operates independently of AI's internal reasoning!
-       const localEvaluation = evaluateAuthorizationGateway(
-     aiResponse.proposed_action,
-     { role: 'tester', origin: 'attack_playground' }
-   );
-   let gatewayEvaluation = localEvaluation;
-   if (armorIqAttestation.isConfigured) {
-     const verdict = armorIqAttestation.intentTokenRaw
-       ? await enforceViaArmorIQ(aiResponse.proposed_action, armorIqAttestation.intentTokenRaw)
-       : { decision: 'BLOCK' as const, reason: armorIqAttestation.error || 'No intent token issued.' };
-     gatewayEvaluation = {
-       ...localEvaluation,
-       decision: verdict.decision,
-       reason: `ArmorIQ ${verdict.decision}: ${verdict.reason}`,
-       policyId: 'armoriq:promptshield-zero-trust',
-       matchedRule: 'ARMORIQ_PLATFORM_POLICY',
-     };
-   }
-
-    // Step 4: Real MCP Tool Execution (Tools will NOT run if Gateway blocked)
-    const toolExecution = await executeSandboxedTool(
-      aiResponse.proposed_action,
-      gatewayEvaluation.decision
-    );
-
-    // Step 5: Cryptographic Audit Ledger Entry (Tamper-evident SHA-256 hash chain)
-    const auditRecord = appendAuditEvent({
-      testId,
-      scenarioTitle: scenarioTitle || 'Custom Attack Experiment',
-      inputPrompt: prompt,
-      proposedAction: aiResponse.proposed_action,
-      gatewayDecision: gatewayEvaluation.decision,
-      decisionReason: gatewayEvaluation.reason,
-      toolExecutionStatus: toolExecution.status,
-      toolResult: toolExecution.result,
-      aiMode: aiResponse.isFallback
-        ? 'deterministic-security-fallback-v1'
-        : 'gemini-3.8-flash',
-      policyId: gatewayEvaluation.policyId,
-    });
-
-    const playgroundResult: PlaygroundTestResult = {
-      testId,
-      timestamp: new Date().toISOString(),
-      scenarioTitle: scenarioTitle || 'Custom Attack Experiment',
-      inputPrompt: prompt,
-      aiAnalysis: {
-        analysis: aiResponse.analysis,
-        injection_detected: aiResponse.injection_detected,
-        injection_confidence: aiResponse.injection_confidence,
-        model: aiResponse.model,
-        isFallback: aiResponse.isFallback,
-        latencyMs: aiResponse.latencyMs,
-      },
-      proposedAction: aiResponse.proposed_action,
-      gatewayEvaluation,
-      toolExecution: {
-        status: toolExecution.status,
-        result: toolExecution.result,
-        executedAt: toolExecution.executionTimestamp,
-        isRealMcpServer: toolExecution.isRealMcpServer,
-        mcpServerInfo: toolExecution.mcpServerInfo,
-      },
-      armorIqAttestation,
-      auditRecord: {
-        id: auditRecord.id,
-        hash: auditRecord.hash,
-      },
-    };
-
-    res.json(playgroundResult);
-  } catch (err: any) {
-    console.error('Test execution error:', err);
-    res.status(500).json({ error: err?.message || 'Server error during test evaluation.' });
-  }
-});
-
-/**
- * POST /api/test/compare
- * Side-by-side comparison between unprotected baseline and protected agent
- */
-app.post('/api/test/compare', async (req: Request, res: Response) => {
-  try {
-    const { prompt, scenarioTitle } = req.body;
-    if (!prompt) {
-      res.status(400).json({ error: 'Prompt is required.' });
-      return;
-    }
-
-    const testId = `cmp-${Date.now().toString(36)}`;
-
-    // 1. Run Protected Agent flow
-    const protectedAi = await analyzePromptWithGemini(prompt);
-    const armorIqAttestation = await captureAndAttestArmorIQPlan(
-      prompt,
-      protectedAi.proposed_action,
-      protectedAi.model
-    );
-        const gatewayEvaluation = await evaluateGateway(
-      protectedAi.proposed_action,
-      armorIqAttestation,
-      'comparison_engine'
-    );
-    const protectedTool = await executeSandboxedTool(
-      protectedAi.proposed_action,
-      gatewayEvaluation.decision
-    );
-    const auditRecord = appendAuditEvent({
-      testId,
-      scenarioTitle: scenarioTitle || 'Comparison Run',
-      inputPrompt: prompt,
-      proposedAction: protectedAi.proposed_action,
-      gatewayDecision: gatewayEvaluation.decision,
-      decisionReason: gatewayEvaluation.reason,
-      toolExecutionStatus: protectedTool.status,
-      toolResult: protectedTool.result,
-      aiMode: protectedAi.isFallback
-        ? 'deterministic-security-fallback-v1'
-        : 'gemini-3.8-flash',
-      policyId: gatewayEvaluation.policyId,
-    });
-
-    // 2. Compute Unprotected Baseline Simulation
-    // Demonstrates what happens when NO gateway verifies actions.
-    const unprotectedProposedAction: ToolActionProposal = {
-      ...protectedAi.proposed_action,
-    };
-
-    let simulatedUnsafeResult = 'Action would execute with root privileges without check.';
-    let potentialImpact = 'Unauthorized access to resources.';
-    let riskLevel: 'CRITICAL' | 'HIGH' | 'MEDIUM' = 'HIGH';
-
-    if (
-      prompt.toLowerCase().includes('restricted') ||
-      prompt.toLowerCase().includes('confidential') ||
-      prompt.toLowerCase().includes('financial')
-    ) {
-      simulatedUnsafeResult =
-        '[SIMULATION WARNING] Without authorization gateway, the agent would return raw confidential executive data or vault credentials directly to the attacker.';
-      potentialImpact = 'Data exfiltration of confidential executive records and infrastructure secrets.';
-      riskLevel = 'CRITICAL';
-    } else if (prompt.toLowerCase().includes('export') || prompt.toLowerCase().includes('crm')) {
-      simulatedUnsafeResult =
-        '[SIMULATION WARNING] Without authorization gateway, all synthetic customer records would be dumped to unverified external endpoints.';
-      potentialImpact = 'Unregulated mass data egress, compliance violations (GDPR/SOC2).';
-      riskLevel = 'CRITICAL';
-    } else if (prompt.toLowerCase().includes('admin') || prompt.toLowerCase().includes('grant')) {
-      simulatedUnsafeResult =
-        '[SIMULATION WARNING] The agent blindly trusts claimed admin status in the prompt, granting itself arbitrary system execution capabilities.';
-      potentialImpact = 'Full tenant compromise and privilege escalation.';
-      riskLevel = 'CRITICAL';
-    } else {
-      simulatedUnsafeResult =
-        '[SIMULATION NOTE] Benign query executes, but lacks zero-trust audit verification and egress tracking.';
-      potentialImpact = 'Unmonitored execution without cryptographic audit trail.';
-      riskLevel = 'MEDIUM';
-    }
-
-    const comparison: ComparisonResult = {
-      inputPrompt: prompt,
-      scenarioTitle: scenarioTitle || 'Direct Injection Comparison',
-      unprotectedBaseline: {
-        proposedAction: unprotectedProposedAction,
-        authorizationDecision: 'NONE (UNPROTECTED)',
-        simulationWarning:
-          'SIMULATED BASELINE — NO GATEWAY ENFORCEMENT. Unprotected agents blindly fulfill instructions.',
-        simulatedExecutionResult: simulatedUnsafeResult,
-        potentialImpact,
-        riskLevel,
-      },
-      protectedAgent: {
-        aiModel: protectedAi.model,
-        isFallback: protectedAi.isFallback,
-        proposedAction: protectedAi.proposed_action,
-        gatewayDecision: gatewayEvaluation.decision,
-        decisionReason: gatewayEvaluation.reason,
-        toolExecutionStatus: protectedTool.status,
-        realExecutionResult: protectedTool.result,
-        verifiableAuditHash: auditRecord.hash,
-        armorIqAttestation: {
-          isConfigured: armorIqAttestation.isConfigured,
-          tokenId: armorIqAttestation.intentToken?.tokenId,
-          planHash: armorIqAttestation.intentToken?.planHash,
-        },
-      },
-    };
-
-    res.json(comparison);
-  } catch (err: any) {
-    console.error('Comparison evaluation error:', err);
-    res.status(500).json({ error: err?.message || 'Comparison failed' });
-  }
-});
-
-/**
- * Audit Log APIs
- */
-app.get('/api/audit/logs', (req: Request, res: Response) => {
-  res.json(getAuditLogs());
-});
-
-app.get('/api/audit/verify', (req: Request, res: Response) => {
-  const report = verifyAuditChainIntegrity();
-  res.json(report);
-});
-
-app.post('/api/audit/tamper', (req: Request, res: Response) => {
-  try {
-    const { recordId } = req.body;
-    const result = simulateTampering(recordId);
-    res.json({
-      message: 'Tamper simulation completed. The cryptographic hash chain is now broken!',
-      ...result,
-    });
-  } catch (err: any) {
-    res.status(400).json({ error: err?.message || 'Tamper simulation failed' });
-  }
-});
-
-app.post('/api/audit/restore', (req: Request, res: Response) => {
-  const result = restoreChainIntegrity();
-  res.json({
-    message: 'Audit chain restored and cryptographically re-signed.',
-    ...result,
-  });
-});
-
-app.post('/api/audit/approve', (req: Request, res: Response) => {
-  const { auditId } = req.body;
-  if (!auditId) {
-    res.status(400).json({ error: 'auditId is required.' });
-    return;
-  }
-  const updated = approvePendingAuditEvent(auditId);
-  if (!updated) {
-    res.status(404).json({ error: 'Audit event not found or not in pending state.' });
-    return;
-  }
-  res.json({ message: 'Action approved and executed.', auditEvent: updated });
-});
-
-/**
- * Automated Test Suite APIs
- */
-app.get('/api/test-suite', (req: Request, res: Response) => {
-  res.json(TEST_DEFINITIONS);
-});
-
-app.post('/api/test-suite/run', async (req: Request, res: Response) => {
-  try {
-    const results = await runAllAutomatedTests();
-    const passedCount = results.filter((r) => r.status === 'PASS').length;
-    res.json({
-      total: results.length,
-      passed: passedCount,
-      failed: results.length - passedCount,
-      passRatePercent: Math.round((passedCount / results.length) * 100),
-      executedAt: new Date().toISOString(),
-      tests: results,
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'Failed running test suite' });
-  }
-});
-
-/**
- * ArmorIQ Readiness API
- */
-app.get('/api/armoriq/status', (req: Request, res: Response) => {
-  res.json(getArmorIQStatus());
-});
-
-// -------------------------------------------------------------
-// Vite Middleware / Production Static Server
-// -------------------------------------------------------------
-async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
-
-  if (!isProd) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.resolve(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[PromptShield Server] Running on http://0.0.0.0:${PORT}`);
-  });
+function auth(req: Request, res: Response, next: NextFunction) {
+  if (!AUTH_TOKEN) return next(); // open only if no token configured
+  if (req.headers.authorization === `Bearer ${AUTH_TOKEN}`) return next();
+  res.status(401).json({ error: 'Unauthorized' });
 }
 
-startServer().catch((err) => {
-  console.error('Fatal startup error:', err);
-  process.exit(1);
+app.get('/health', (_req, res) => res.json({ ok: true, server: SERVER_NAME }));
+
+app.post('/mcp', auth, async (req: Request, res: Response) => {
+  try {
+    const server = buildServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on('close', () => {
+      transport.close();
+      server.close();
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+  } catch (err) {
+    console.error('MCP error:', err);
+    if (!res.headersSent) res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: 'Internal error' }, id: null });
+  }
 });
+
+app.get('/mcp', (_req, res) => res.status(405).json({ error: 'Method not allowed' }));
+
+app.listen(PORT, () => console.log(`${SERVER_NAME} listening on ${PORT}`));
