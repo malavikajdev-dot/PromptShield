@@ -495,13 +495,22 @@ export async function enforceViaArmorIQ(
     }
     return { decision: 'ALLOW', reason: 'Allowed by ArmorIQ policy.' };
   } catch (err: any) {
-     let detail = '';
-     try {
-       detail = JSON.stringify(err, Object.getOwnPropertyNames(err)).slice(0, 700);
-     } catch {
-       detail = String(err);
-     }
-     console.error('[ArmorIQ invoke ERROR]', proposal.tool_name, detail);
-     return { decision: 'BLOCK', reason: `ArmorIQ error: ${detail.slice(0, 300)}` };
-   }
+  const info: Record<string, any> = {};
+  for (const k of Object.getOwnPropertyNames(err || {})) {
+    if (k === 'stack') continue;
+    try { info[k] = (err as any)[k]; } catch {}
   }
+  const extra = {
+    name: err?.name,
+    cause: err?.cause,
+    status: err?.status ?? err?.statusCode ?? err?.response?.status,
+    data: err?.response?.data ?? err?.data ?? err?.details,
+    ...info,
+  };
+  let detail = '';
+  try { detail = JSON.stringify(extra, (_k, v) => (typeof v === 'bigint' ? String(v) : v)); }
+  catch { detail = String(err); }
+  console.error('[ArmorIQ invoke ERROR]', proposal.tool_name, detail);
+  return { decision: 'BLOCK', reason: `ArmorIQ error: ${detail.slice(0, 400)}` };
+  }
+}
