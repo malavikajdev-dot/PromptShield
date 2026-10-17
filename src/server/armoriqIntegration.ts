@@ -466,7 +466,28 @@ export interface ArmorIQVerdict {
   decision: 'ALLOW' | 'BLOCK' | 'APPROVAL_REQUIRED';
   reason: string;
 }
+function parsePolicyBlock(err: any): { toolName?: string; reason: string } | null {
+  const status = err?.status ?? err?.statusCode ?? err?.response?.status;
+  let data: any = err?.response?.data ?? err?.data ?? err?.details;
 
+  if (!data && typeof err?.message === 'string') {
+    try { data = JSON.parse(err.message); } catch { /* not JSON */ }
+  }
+
+  const isPolicyBlock =
+    err?.name === 'PolicyBlockedException' ||
+    data?.enforcementAction === 'block' ||
+    (status === 403 && /polic/i.test(String(data?.error ?? err?.message ?? '')));
+
+  if (!isPolicyBlock) return null;
+
+  const toolName = data?.toolName;
+  const code = data?.reason ?? data?.data?.reason ?? 'policy_constraints_not_satisfied';
+  return {
+    toolName,
+    reason: `${toolName ? `Tool '${toolName}'` : 'Action'} denied by ArmorIQ policy (${code})`,
+  };
+}
 export async function enforceViaArmorIQ(
   proposal: ToolActionProposal,
   intentToken: IntentToken
@@ -497,23 +518,17 @@ export async function enforceViaArmorIQ(
       return { decision: 'APPROVAL_REQUIRED', reason: reason || 'Held by ArmorIQ for human approval.' };
     }
     return { decision: 'ALLOW', reason: 'Allowed by ArmorIQ policy.' };
-  } catch (err: any) {
-  const info: Record<string, any> = {};
-  for (const k of Object.getOwnPropertyNames(err || {})) {
-    if (k === 'stack') continue;
-    try { info[k] = (err as any)[k]; } catch {}
-  }
-  const extra = {
-    name: err?.name,
-    cause: err?.cause,
-    status: err?.status ?? err?.statusCode ?? err?.response?.status,
-    data: err?.response?.data ?? err?.data ?? err?.details,
-    ...info,
-  };
-  let detail = '';
-  try { detail = JSON.stringify(extra, (_k, v) => (typeof v === 'bigint' ? String(v) : v)); }
-  catch { detail = String(err); }
-  console.error('[ArmorIQ invoke ERROR]', proposal.tool_name, detail);
-  return { decision: 'BLOCK', reason: `ArmorIQ error: ${detail.slice(0, 400)}` };
+  }   catch (err: any) {
+    const block = parsePolicyBlock(err);
+    if (block) {
+      console.log('[ArmorIQ policy BLOCK]', proposal.tool_name, block.reason);
+      return { decision: 'BLOCK', reason: block.reason };
+    }
+
+    console.error('[ArmorIQ invoke ERROR]', proposal.tool_name, err?.name, err?.message);
+    return {
+      decision: 'BLOCK',
+      reason: `ArmorIQ unreachable or errored (fail-closed): ${String(err?.message || err).slice(0, 200)}`,
+    };
   }
 }
